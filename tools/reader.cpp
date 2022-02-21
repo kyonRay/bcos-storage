@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <functional>
 #include <iterator>
+#include <future>
 
 using namespace std;
 using namespace rocksdb;
@@ -38,11 +39,13 @@ po::options_description main_options("Main for Table benchmark");
 
 po::variables_map initCommandLine(int argc, const char* argv[])
 {
-    main_options.add_options()("help,h", "help of Table benchmark")(
-        "path,p", po::value<string>()->default_value(""), "[RocksDB path]")("name,n",
-        po::value<string>()->default_value(""), "[RocksDB name]")("table,t", po::value<string>(),
-        "table name ")("key,k", po::value<string>()->default_value(""), "table key")(
-        "iterate,i", po::value<bool>()->default_value(false), "traverse table");
+    main_options.add_options()
+    ("help,h", "help of Table benchmark")
+    ("path,p", po::value<string>()->default_value(""), "[RocksDB path]")
+    ("name,n",po::value<string>()->default_value(""), "[RocksDB name]")
+    ("table,t", po::value<string>(),"table name ")
+    ("key,k", po::value<string>()->default_value(""), "table key")
+    ("iterate,i", po::value<bool>()->default_value(false), "traverse table");
     po::variables_map vm;
     try
     {
@@ -117,7 +120,6 @@ int main(int argc, const char* argv[])
             std::string hex;
             hex.reserve(k.size() * 2);
             boost::algorithm::hex_lower(k.begin(), k.end(), std::back_inserter(hex));
-            cout << "key=" << hex << "|";
 
             std::optional<Entry> row;
             adapter->asyncGetRow(tableName, k, [&](Error::Ptr error, std::optional<Entry> entry) {
@@ -133,31 +135,32 @@ int main(int argc, const char* argv[])
             std::string hexData;
             hexData.reserve(view.size() * 2);
             boost::algorithm::hex_lower(view.begin(), view.end(), std::back_inserter(hexData));
+            cout << "key=" << k << "|";
             cout << " [" << hex << "] ";
 
-            cout << " [status=" << row->status() << "]";
+            cout << " [status=" << (int8_t)row->status() << "]";
             //  << " [num=" << row->num() << "]";
             cout << endl;
         }
         return 0;
     }
 
+    std::promise<std::optional<Entry>> p;
     std::optional<Entry> row;
     adapter->asyncGetRow(tableName, key, [&](Error::Ptr error, std::optional<Entry> entry) {
         if (error)
         {
             BOOST_THROW_EXCEPTION(*error);
         }
-
-        row = std::move(entry);
+        p.set_value(std::move(entry));
     });
-
+    row = p.get_future().get();
     auto view = row->get();
     std::string hexData;
     hexData.reserve(view.size() * 2);
     boost::algorithm::hex_lower(view.begin(), view.end(), std::back_inserter(hexData));
-    cout << " [" << hex << "] ";
-
-    cout << " [status=" << row->status() << "]";
+    cout << "key=" << key << "|";
+    cout << " [" << hexData << "] ";
+    cout << " [status=" << std::to_string(row->status()) << "]";
     return 0;
 }

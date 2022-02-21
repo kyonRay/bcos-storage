@@ -35,6 +35,7 @@
 cmake/scripts/**
 cmake/deps/**
 build/**
+.idea/**
 .clang-format
 .vscode/**
 .DS_Store
