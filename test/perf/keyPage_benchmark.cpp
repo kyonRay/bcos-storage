@@ -13,7 +13,7 @@
  *  See the License for the specific language governing permissions and
  *  limitations under the License.
  *
- * @file keyRow_benchmark.cpp
+ * @file keyPage_benchmark.cpp
  * @author: kyonGuo
  * @date 2022/2/17
  */
@@ -22,10 +22,11 @@
 #include "boost/filesystem.hpp"
 #include <boost/program_options.hpp>
 #include <boost/property_tree/ptree.hpp>
+#include <boost/log/core.hpp>
+#include <boost/serialization/unordered_map.hpp>
 #include <boost/serialization/vector.hpp>
 #include <boost/archive/binary_iarchive.hpp>
 #include <boost/archive/binary_oarchive.hpp>
-#include <boost/log/core.hpp>
 #include <cstdlib>
 #include <functional>
 #include <rocksdb/write_batch.h>
@@ -42,12 +43,14 @@ namespace po = boost::program_options;
 
 boost::program_options::options_description main_options("Main for Table benchmark");
 
+static const ssize_t MAX_PAGE_CAPACITY = 32 * 1024 * 1024;
+
 po::variables_map initCommandLine(int argc, const char *argv[]) {
     main_options.add_options()
             ("help,h", "help of Table benchmark")
             ("path,p", po::value<string>()->default_value("benchmark"), "[RocksDB path]")
-            ("name,n", po::value<string>()->default_value("tableName"), "[table name]")
-            ("keys,k", po::value<int>()->default_value(10000), "the number of different keys")
+            ("name,n", po::value<string>()->default_value("tableName2"), "[table name]")
+            ("keysNum,k", po::value<int>()->default_value(10000), "the number of different keys")
             ("value,v", po::value<int>()->default_value(256), "the length of value")
             ("mode,m", po::value<int>()->default_value(3), "m=1,only do write;m=2,only do read;m=3,do all test")
             ("batch,b", po::value<bool>()->default_value(true), "do batch test")
@@ -68,25 +71,62 @@ po::variables_map initCommandLine(int argc, const char *argv[]) {
     return vm;
 }
 
-void writeBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const vector<string> &_keyVec,
-                const string &value) {
-    auto stateStorage = std::make_shared<bcos::storage::StateStorage>(dbStorage);
+std::unique_ptr<string> encodePage(const unordered_map<string, string> &page) {
+    stringstream ss;
+    boost::archive::binary_oarchive oarchive(ss);
+    oarchive << page;
+    return make_unique<string>(ss.str());
+}
+
+void decodePage(const string &encodeStr, unordered_map<string, string> &mut_page) {
+    stringstream ss(encodeStr);
+    boost::archive::binary_iarchive iarchive(ss);
+    iarchive >> mut_page;
+}
+
+
+void writeBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName,
+                const vector<string> &_keyVec, const string &value, int pageNum) {
+    auto stateStorage = make_shared<StateStorage>(dbStorage);
+
+    vector<unordered_map<string, string>> pages = {};
+    for (int i = 0; i < pageNum; ++i) {
+        unordered_map<string, string> m({});
+        pages.emplace_back(std::move(m));
+    }
 
     auto count = _keyVec.size();
-    cout << "<<<<<<<<<< Write batch " << "count: " << count << endl;
-    auto table = stateStorage->openTable(tableName);
-    for (const auto &key: _keyVec) {
-        Entry entry;
-        entry.importFields({value});
-        table->setRow(key, entry);
-    }
-    auto params1 = bcos::storage::TransactionalStorageInterface::TwoPCParams();
-    params1.number = 100;
-    params1.primaryTableName = tableName;
-    params1.primaryTableKey = "key0";
-    std::promise<Error::Ptr> e;
+    cout << "<<<<<<<<<< Write page batch " << "count: " << count << endl;
 
-    auto now = std::chrono::system_clock::now();
+    // simulate discrete write batch data
+    for (const auto &key: _keyVec) {
+        int chosenPage = (boost::lexical_cast<int>(key.substr(key.size() - 2)) % pageNum);
+        if (pages[chosenPage].size() * value.size() >= MAX_PAGE_CAPACITY) {
+            while (pages[chosenPage].size() * value.size() >= MAX_PAGE_CAPACITY) {
+                chosenPage = (++chosenPage) % pageNum;
+            }
+        }
+        pages[chosenPage].emplace(key, value);
+    }
+
+    auto now = chrono::system_clock::now();
+    vector<string> valueVec = {};
+    for (const auto &page: pages) {
+        auto s = encodePage(page);
+        valueVec.emplace_back(*s);
+    }
+    auto table = stateStorage->openTable(tableName);
+
+    int i = 0;
+    for (const auto &encodeValue: valueVec) {
+        Entry entry;
+        entry.importFields({encodeValue});
+        table->setRow("key" + to_string(i++), entry);
+    }
+    auto params1 = TransactionalStorageInterface::TwoPCParams();
+    params1.primaryTableName = tableName;
+    promise<Error::Ptr> e;
+
     // pre-write, put to rocksdb buffer
     dbStorage->asyncPrepare(params1, *stateStorage, [&](Error::Ptr, uint64_t ts) {
         params1.startTS = ts;
@@ -95,10 +135,11 @@ void writeBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, 
         // check commit success
     });
     auto err = e.get_future().get();
-    auto elapsed = std::chrono::duration_cast<chrono::milliseconds>(std::chrono::system_clock::now() - now);
+    auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::system_clock::now() - now);
     cout << "<<<<<<<<<< Write batch finished"
-         << "|time used(ms)=" << std::setiosflags(std::ios::fixed) << std::setprecision(3)
-         << elapsed.count() << "|" << endl;
+         << "|time used(ms)=" << setiosflags(ios_base::fixed) << setprecision(3)
+         << elapsed.count() << " rounds=" << count << " tps=" << count / elapsed.count() << "|"
+         << endl;
     if (err != nullptr) {
         cout << "commit error: " << err->errorMessage() << endl;
     }
@@ -121,39 +162,91 @@ void createTable(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName)
 }
 
 void writeSingle(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const string &key,
-                 const string &value) {
-    Entry entry;
-    entry.importFields({value});
-    std::promise<Error::UniquePtr> p;
-    dbStorage->asyncSetRow(tableName, key, entry, [&](Error::UniquePtr _e) {
-        p.set_value(std::move(_e));
+                 const string &value, int pageNum) {
+    int chosenPage = boost::lexical_cast<int>(key.substr(key.size() - 2)) % pageNum;
+    promise<std::optional<Entry>> p;
+    dbStorage->asyncGetRow(tableName, "key" + to_string(chosenPage),
+                           [&](Error::UniquePtr, std::optional<Entry> entry) {
+                               p.set_value(std::move(entry));
+                           });
+    auto e = p.get_future().get();
+    unordered_map<string, string> empty_page;
+
+    decodePage(string(e->getField(0)), empty_page);
+    // not check capacity, for convenience
+    empty_page.emplace(key, value);
+    Entry newEntry;
+    newEntry.importFields({std::move(*encodePage(empty_page))});
+    promise<Error::UniquePtr> p2;
+    dbStorage->asyncSetRow(tableName, "key" + to_string(chosenPage), std::move(newEntry), [&](Error::UniquePtr _e) {
+        p2.set_value(std::move(_e));
     });
-    std::ignore = p.get_future().get();
+    auto error = p2.get_future().get();
+    if (error) {
+        cout << "write single error: " << error->errorMessage() << " key: " << key << endl;
+    }
+};
+
+void readSingle(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const std::string &_key, int pageNum) {
+    int chosenPage = boost::lexical_cast<int>(_key.substr(_key.size() - 2)) % pageNum;
+    std::promise<std::tuple<Error::UniquePtr, std::optional<Entry>>> p;
+    dbStorage->asyncGetRow(tableName, "key" + to_string(chosenPage),
+                           [&p](Error::UniquePtr _e, std::optional<Entry> _entry) {
+                               p.set_value(std::make_tuple(std::move(_e), _entry));
+                           });
+    auto[e, entry] = p.get_future().get();
+    if (e != nullptr || !entry.has_value()) {
+        cout << "read_single error: " << e->errorMessage() << endl;
+        return;
+    }
+    unordered_map<string, string> page;
+    decodePage(std::string(entry->getField(0)), page);
+    ignore = page[_key];
 };
 
 void
-readBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const gsl::span<std::string const> &_keys) {
+readBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const gsl::span<std::string const> &_keys,
+          int pageNum) {
+
+    std::vector<Entry> resultEntries = {};
+    unordered_map<string, vector<string>> page2Keys;
+    for (const auto &key: _keys) {
+        auto chosenPage = boost::lexical_cast<int>(key.substr(key.size() - 2)) % pageNum;
+        page2Keys["key" + to_string(chosenPage)].emplace_back(key);
+    }
+    vector<string> pageKeys(page2Keys.size());
+    transform(page2Keys.begin(), page2Keys.end(), pageKeys.begin(), [](const auto &p) { return p.first; });
+    auto now = chrono::system_clock::now();
     std::promise<std::tuple<Error::UniquePtr, std::vector<std::optional<Entry>>>> p;
-    dbStorage->asyncGetRows(tableName, _keys,
+    dbStorage->asyncGetRows(tableName, gsl::make_span(pageKeys),
                             [&p](Error::UniquePtr _e, std::vector<std::optional<Entry>> _entries) {
-                                p.set_value(std::make_tuple(std::move(_e), _entries));
+                                p.set_value(std::make_tuple(std::move(_e), std::move(_entries)));
                             });
     auto[e, entries] = p.get_future().get();
-    cout << "<<<<<<<<<< read_batch entries size: " << entries.size() << endl;
+    cout << "<<<<<<<<<< read_batch page entries size: " << entries.size() << endl;
     if (e != nullptr) {
         cout << "read_batch error: " << e->errorMessage() << endl;
+        return;
     }
-};
-
-void readSingle(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const std::string &_key) {
-    std::promise<std::tuple<Error::UniquePtr, std::optional<Entry>>> p;
-    dbStorage->asyncGetRow(tableName, _key, [&p](Error::UniquePtr _e, std::optional<Entry> _entry) {
-        p.set_value(std::make_tuple(std::move(_e), _entry));
-    });
-    auto[e, entry] = p.get_future().get();
-    if (e != nullptr) {
-        cout << "read_single error: " << e->errorMessage() << endl;
+    for (size_t i = 0; i < pageKeys.size(); ++i) {
+        auto pageStr = entries.at(i)->getField(0);
+        if (pageStr.empty()) {
+            cerr << "pageStr is empty, pageKey: " << i << endl;
+            exit(-1);
+        }
+        unordered_map<string, string> page;
+        decodePage(string(pageStr), page);
+        for (const auto &key: page2Keys[pageKeys[i]]) {
+            Entry entry;
+            entry.importFields({page[key]});
+            resultEntries.emplace_back(std::move(entry));
+        }
     }
+    auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::system_clock::now() - now);
+    cout << "<<<<<<<<<< Read batch finished"
+         << "|time used(ms)=" << setiosflags(ios_base::fixed) << setprecision(3)
+         << elapsed.count() << "|" << endl;
+    cout << "<<<<<<<<<< read_batch entries size: " << resultEntries.size() << endl;
 };
 
 void getKeys(vector<string> &keyVec, int keysNum, int mode) {
@@ -161,7 +254,7 @@ void getKeys(vector<string> &keyVec, int keysNum, int mode) {
         case 1: {
             // only write, write file
             for (int i = 0; i < keysNum; ++i) {
-                auto key = boost::lexical_cast<std::string>(i);
+                auto key = to_string(random());
                 keyVec.emplace_back(std::move(key));
             }
             auto path = fs::path("bench_keys");
@@ -197,7 +290,7 @@ void getKeys(vector<string> &keyVec, int keysNum, int mode) {
         }
         case 3: {
             for (int i = 0; i < keysNum; ++i) {
-                auto key = boost::lexical_cast<std::string>(i);
+                auto key = to_string(random());
                 keyVec.emplace_back(std::move(key));
             }
             // write and read, use hot data
@@ -216,14 +309,17 @@ int main(int argc, const char *argv[]) {
     if (params.count("random")) {
         storagePath += to_string(utcTime());
     }
-    auto keys = params["keys"].as<int>();
+    auto keysNum = params["keysNum"].as<int>();
     auto valueLength = params["value"].as<int>();
     string testTableName = params["name"].as<string>();
     auto mode = params["mode"].as<int>();
     auto batch = params["batch"].as<bool>();
 
+    int pageNum = ceil(long(keysNum) * valueLength / MAX_PAGE_CAPACITY) + 1;
+
     std::vector<std::string> keyVec = {};
-    getKeys(keyVec, keys, mode);
+    getKeys(keyVec, keysNum, mode);
+    keysNum = keyVec.size();
 
     string value;
     value.resize(valueLength);
@@ -246,8 +342,9 @@ int main(int argc, const char *argv[]) {
 
     cout << "rocksdb path    : " << storagePath << endl;
     cout << "table name      : " << testTableName << endl;
-    cout << "keys number     : " << keys << endl;
+    cout << "keysNum number  : " << keysNum << endl;
     cout << "value length(B) : " << valueLength << endl;
+    cout << "page number     : " << pageNum << endl;
     cout << "batch test      : " << batch << endl;
     auto dbStorage = std::make_shared<RocksDBStorage>(std::unique_ptr<rocksdb::DB>(db));
 
@@ -266,12 +363,10 @@ int main(int argc, const char *argv[]) {
     cout << "<<<<<<<<<< " << "Check table" << endl;
     createTable(dbStorage, testTableName);
     if (mode & 1 && batch) {
-        writeBatch(dbStorage, testTableName, keyVec, value);
+        writeBatch(dbStorage, testTableName, keyVec, value, pageNum);
     }
     if (mode & 2 && batch) {
-        performance("Read batch", [&]() {
-            readBatch(dbStorage, testTableName, gsl::make_span(keyVec));
-        });
+        readBatch(dbStorage, testTableName, gsl::make_span(keyVec), pageNum);
     }
     for (auto &item: keyVec) {
         item += to_string(utcTime());
@@ -279,14 +374,14 @@ int main(int argc, const char *argv[]) {
     if (mode & 1 && !batch) {
         performance("Write single", [&]() {
             for (const auto &key: keyVec) {
-                writeSingle(dbStorage, testTableName, key, value);
+                writeSingle(dbStorage, testTableName, key, value, pageNum);
             }
         });
     }
     if (mode & 2 && !batch) {
         performance("Read single", [&]() {
             for (const auto &key: keyVec) {
-                readSingle(dbStorage, testTableName, key);
+                readSingle(dbStorage, testTableName, key, pageNum);
             }
         });
     }
