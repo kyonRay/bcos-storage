@@ -78,20 +78,17 @@ void writeBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, 
     for (const auto &key: _keyVec) {
         Entry entry;
         entry.importFields({value});
-        table->setRow(key, entry);
+        table->setRow(key, std::move(entry));
     }
     auto params1 = bcos::storage::TransactionalStorageInterface::TwoPCParams();
-    params1.number = 100;
     params1.primaryTableName = tableName;
-    params1.primaryTableKey = "key0";
     std::promise<Error::Ptr> e;
 
     auto now = std::chrono::system_clock::now();
     // pre-write, put to rocksdb buffer
-    dbStorage->asyncPrepare(params1, *stateStorage, [&](Error::Ptr, uint64_t ts) {
-        params1.startTS = ts;
+    dbStorage->asyncPrepare(params1, *stateStorage, [&](Error::Ptr, uint64_t) {
         // commit buffer
-        dbStorage->asyncCommit(params1, [&](Error::Ptr _e) { e.set_value(_e); });
+        dbStorage->asyncCommit(params1, [&](Error::Ptr _e) { e.set_value(std::move(_e)); });
         // check commit success
     });
     auto err = e.get_future().get();
@@ -132,16 +129,33 @@ void writeSingle(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName,
 };
 
 void
-readBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const gsl::span<std::string const> &_keys) {
+readBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const gsl::span<std::string const> &_keys,
+          size_t valueLen = 0) {
+    auto now = std::chrono::system_clock::now();
     std::promise<std::tuple<Error::UniquePtr, std::vector<std::optional<Entry>>>> p;
     dbStorage->asyncGetRows(tableName, _keys,
                             [&p](Error::UniquePtr _e, std::vector<std::optional<Entry>> _entries) {
-                                p.set_value(std::make_tuple(std::move(_e), _entries));
+                                p.set_value(std::make_tuple(std::move(_e), std::move(_entries)));
                             });
     auto[e, entries] = p.get_future().get();
+    auto elapsed = std::chrono::duration_cast<chrono::milliseconds>(std::chrono::system_clock::now() - now);
+    cout << "<<<<<<<<<< Read batch finished"
+         << "|time used(ms)=" << std::setiosflags(std::ios::fixed) << std::setprecision(3)
+         << elapsed.count() << "|" << endl;
     cout << "<<<<<<<<<< read_batch entries size: " << entries.size() << endl;
     if (e != nullptr) {
         cout << "read_batch error: " << e->errorMessage() << endl;
+    }
+    if (valueLen != 0) {
+        size_t errorCount = 0;
+        for (const auto &entry: entries) {
+            if (entry->get().size() != valueLen) {
+                errorCount++;
+            }
+        }
+        if (errorCount) {
+            cerr << "error entries: " << errorCount << endl;
+        }
     }
 };
 
@@ -156,7 +170,7 @@ void readSingle(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, 
     }
 };
 
-void getKeys(vector<string> &keyVec, int keysNum, int mode) {
+void getKeys(vector<string> &keyVec, int keysNum, int mode, const string &storagePath) {
     switch (mode) {
         case 1: {
             // only write, write file
@@ -164,7 +178,7 @@ void getKeys(vector<string> &keyVec, int keysNum, int mode) {
                 auto key = boost::lexical_cast<std::string>(i);
                 keyVec.emplace_back(std::move(key));
             }
-            auto path = fs::path("bench_keys");
+            auto path = fs::path("bench_keys_" + storagePath);
             if (fs::exists(path)) {
                 fs::remove_all(path);
             }
@@ -181,13 +195,13 @@ void getKeys(vector<string> &keyVec, int keysNum, int mode) {
             break;
         }
         case 2: {
-            auto path = fs::path("bench_keys");
+            auto path = fs::path("bench_keys_" + storagePath);
             fs::ifstream input(path, ios_base::in);
             try {
                 boost::archive::binary_iarchive iarchive(input);
                 iarchive >> keyVec;
             } catch (...) {
-                cout << "write file error" << endl;
+                cout << "read file error" << endl;
                 input.close();
                 exit(-1);
             }
@@ -223,7 +237,7 @@ int main(int argc, const char *argv[]) {
     auto batch = params["batch"].as<bool>();
 
     std::vector<std::string> keyVec = {};
-    getKeys(keyVec, keys, mode);
+    getKeys(keyVec, keys, mode, storagePath);
 
     string value;
     value.resize(valueLength);
@@ -269,12 +283,7 @@ int main(int argc, const char *argv[]) {
         writeBatch(dbStorage, testTableName, keyVec, value);
     }
     if (mode & 2 && batch) {
-        performance("Read batch", [&]() {
-            readBatch(dbStorage, testTableName, gsl::make_span(keyVec));
-        });
-    }
-    for (auto &item: keyVec) {
-        item += to_string(utcTime());
+        readBatch(dbStorage, testTableName, gsl::make_span(keyVec), valueLength);
     }
     if (mode & 1 && !batch) {
         performance("Write single", [&]() {
