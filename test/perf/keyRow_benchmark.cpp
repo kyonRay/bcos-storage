@@ -29,6 +29,8 @@
 #include <cstdlib>
 #include <functional>
 #include <rocksdb/write_batch.h>
+#include <rocksdb/perf_context.h>
+#include <rocksdb/iostats_context.h>
 #include <bcos-framework/libstorage/StateStorage.h>
 #include <future>
 #include <optional>
@@ -42,6 +44,8 @@ namespace po = boost::program_options;
 
 boost::program_options::options_description main_options("Main for Table benchmark");
 
+static const ssize_t MAX_CACHE_CAPACITY = 8 * 1024 * 1024;
+
 po::variables_map initCommandLine(int argc, const char *argv[]) {
     main_options.add_options()
             ("help,h", "help of Table benchmark")
@@ -51,6 +55,7 @@ po::variables_map initCommandLine(int argc, const char *argv[]) {
             ("value,v", po::value<int>()->default_value(256), "the length of value")
             ("mode,m", po::value<int>()->default_value(3), "m=1,only do write;m=2,only do read;m=3,do all test")
             ("batch,b", po::value<bool>()->default_value(true), "do batch test")
+            ("static,s", po::value<bool>()->default_value(false))
             ("random,r", "every test use a new rocksdb");
     po::variables_map vm;
     try {
@@ -170,14 +175,28 @@ void readSingle(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, 
     }
 };
 
-void getKeys(vector<string> &keyVec, int keysNum, int mode, const string &storagePath) {
+void getKeys(vector<string> &keyVec, int keysNum, int mode, const string &storagePath, int groupSize) {
+    auto keyInsert = [&]() {
+        int prefixNum = 1;
+        int pageCount = 0;
+        for (int i = 0; i < keysNum; ++i) {
+            if (pageCount > groupSize) {
+                prefixNum++;
+                pageCount = 0;
+            } else {
+                pageCount++;
+            }
+            stringstream prefixStream;
+            prefixStream << std::left << std::setfill('x') << std::setw(5) << to_string(prefixNum);
+            auto key = prefixStream.str() + to_string(random());
+            keyVec.emplace_back(std::move(key));
+        }
+    };
+
     switch (mode) {
         case 1: {
             // only write, write file
-            for (int i = 0; i < keysNum; ++i) {
-                auto key = boost::lexical_cast<std::string>(i);
-                keyVec.emplace_back(std::move(key));
-            }
+            keyInsert();
             auto path = fs::path("bench_keys_" + storagePath);
             if (fs::exists(path)) {
                 fs::remove_all(path);
@@ -210,10 +229,7 @@ void getKeys(vector<string> &keyVec, int keysNum, int mode, const string &storag
             break;
         }
         case 3: {
-            for (int i = 0; i < keysNum; ++i) {
-                auto key = boost::lexical_cast<std::string>(i);
-                keyVec.emplace_back(std::move(key));
-            }
+            keyInsert();
             // write and read, use hot data
             break;
         }
@@ -235,9 +251,10 @@ int main(int argc, const char *argv[]) {
     string testTableName = params["name"].as<string>();
     auto mode = params["mode"].as<int>();
     auto batch = params["batch"].as<bool>();
+    auto statics = params["static"].as<bool>();
 
     std::vector<std::string> keyVec = {};
-    getKeys(keyVec, keys, mode, storagePath);
+    getKeys(keyVec, keys, mode, storagePath, ceil(MAX_CACHE_CAPACITY / valueLength));
 
     string value;
     value.resize(valueLength);
@@ -251,6 +268,10 @@ int main(int argc, const char *argv[]) {
 
     // options.IncreaseParallelism();
     // options.OptimizeLevelStyleCompaction();
+    if (statics) {
+        rocksdb::get_perf_context()->Reset();
+        rocksdb::get_iostats_context()->Reset();
+    }
 
     // create the DB if it's not already present
     options.create_if_missing = true;
@@ -276,14 +297,28 @@ int main(int argc, const char *argv[]) {
              << elapsed.count() << "|" << endl;
     };
 
+    auto staticOP = [&](bool statics, function<void()> op) {
+        if (statics) {
+            rocksdb::SetPerfLevel(rocksdb::PerfLevel::kEnableTimeExceptForMutex);
+        }
+        op();
+        if (statics) {
+            rocksdb::SetPerfLevel(rocksdb::PerfLevel::kDisable);
+            cout << "rocksDB static:" << endl << rocksdb::get_perf_context()->ToString(true) << endl;
+            cout << "IO static:" << endl << rocksdb::get_iostats_context()->ToString(true) << endl;
+            rocksdb::get_perf_context()->Reset();
+            rocksdb::get_iostats_context()->Reset();
+        }
+    };
+
     cout << "<<<<<<<<<< " << endl;
     cout << "<<<<<<<<<< " << "Check table" << endl;
     createTable(dbStorage, testTableName);
     if (mode & 1 && batch) {
-        writeBatch(dbStorage, testTableName, keyVec, value);
+        staticOP(statics, [&]() { writeBatch(dbStorage, testTableName, keyVec, value); });
     }
     if (mode & 2 && batch) {
-        readBatch(dbStorage, testTableName, gsl::make_span(keyVec), valueLength);
+        staticOP(statics, [&]() { readBatch(dbStorage, testTableName, gsl::make_span(keyVec), valueLength); });
     }
     if (mode & 1 && !batch) {
         performance("Write single", [&]() {

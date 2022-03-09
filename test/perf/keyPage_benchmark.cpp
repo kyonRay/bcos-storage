@@ -30,6 +30,8 @@
 #include <cstdlib>
 #include <functional>
 #include <rocksdb/write_batch.h>
+#include <rocksdb/perf_context.h>
+#include <rocksdb/iostats_context.h>
 #include <bcos-framework/libstorage/StateStorage.h>
 #include <future>
 #include <optional>
@@ -55,6 +57,7 @@ po::variables_map initCommandLine(int argc, const char *argv[]) {
             ("mode,m", po::value<int>()->default_value(3), "m=1,only do write;m=2,only do read;m=3,do all test")
             ("batch,b", po::value<bool>()->default_value(true), "do batch test")
             ("linear,l", po::value<bool>()->default_value(true), "get linear keys")
+            ("static,s", po::value<bool>()->default_value(false))
             ("random,r", "every test use a new rocksdb");
     po::variables_map vm;
     try {
@@ -100,12 +103,7 @@ void writeBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName,
 
     // simulate discrete write batch data
     for (const auto &key: _keyVec) {
-        int chosenPage = (boost::lexical_cast<int>(key.substr(key.size() - 4)) % pageNum);
-        if (pages[chosenPage].size() * value.size() >= MAX_PAGE_CAPACITY) {
-            while (pages[chosenPage].size() * value.size() >= MAX_PAGE_CAPACITY) {
-                chosenPage = (++chosenPage) % pageNum;
-            }
-        }
+        int chosenPage = (boost::lexical_cast<int>(key.substr(0, 5)) % pageNum);
         pages[chosenPage].emplace(key, value);
     }
 
@@ -168,7 +166,7 @@ void createTable(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName)
 
 void writeSingle(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const string &key,
                  const string &value, int pageNum) {
-    int chosenPage = boost::lexical_cast<int>(key.substr(key.size() - 4)) % pageNum;
+    int chosenPage = boost::lexical_cast<int>(key.substr(0, 5)) % pageNum;
     promise<std::optional<Entry>> p;
     dbStorage->asyncGetRow(tableName, "key" + to_string(chosenPage),
                            [&](Error::UniquePtr, std::optional<Entry> entry) {
@@ -193,7 +191,7 @@ void writeSingle(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName,
 };
 
 void readSingle(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const std::string &_key, int pageNum) {
-    int chosenPage = boost::lexical_cast<int>(_key.substr(_key.size() - 4)) % pageNum;
+    int chosenPage = boost::lexical_cast<int>(_key.substr(0, 5)) % pageNum;
     std::promise<std::tuple<Error::UniquePtr, std::optional<Entry>>> p;
     dbStorage->asyncGetRow(tableName, "key" + to_string(chosenPage),
                            [&p](Error::UniquePtr _e, std::optional<Entry> _entry) {
@@ -213,9 +211,9 @@ void
 readBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const gsl::span<std::string const> &_keys,
           int pageNum, size_t valueLength = 0) {
     tbb::concurrent_vector<Entry> resultEntries = {};
-    tbb::concurrent_unordered_map<string, vector<string>> page2Keys;
+    tbb::concurrent_unordered_map<string, tbb::concurrent_vector<string>> page2Keys;
     for (const auto &key: _keys) {
-        auto chosenPage = boost::lexical_cast<int>(key.substr(key.size() - 4)) % pageNum;
+        auto chosenPage = boost::lexical_cast<int>(key.substr(0, 5)) % pageNum;
         page2Keys["key" + to_string(chosenPage)].emplace_back(key);
     }
     vector<string> pageKeys(page2Keys.size());
@@ -240,24 +238,24 @@ readBatch(shared_ptr<RocksDBStorage> &dbStorage, const string &tableName, const 
     auto beginDecode = chrono::system_clock::now();
     tbb::concurrent_vector<string> concurrentPageKeys(pageKeys.begin(), pageKeys.end());
     tbb::concurrent_vector<optional<Entry>> concurrentEntries(entries.begin(), entries.end());
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, concurrentPageKeys.size()),
-                      [&](const tbb::blocked_range<size_t> &range) {
-                          for (size_t i = range.begin(); i != range.end(); ++i) {
-                              auto pageStr = concurrentEntries.at(i)->getField(0);
-                              if (pageStr.empty()) {
-                                  cerr << "pageStr is empty, pageKey: " << i << endl;
-                                  exit(-1);
-                              }
-                              unordered_map<string, string> page;
-                              decodePage(string(pageStr), page);
-                              for (const auto &key: page2Keys[concurrentPageKeys.at(i)]) {
-                                  Entry entry;
-                                  auto s = page.at(key);
-                                  entry.importFields({std::move(page.at(key))});
-                                  resultEntries.emplace_back(std::move(entry));
-                              }
-                          }
-                      });
+    auto parallelDecodePage = [&](const tbb::blocked_range<size_t> &range) {
+        for (size_t i = range.begin(); i != range.end(); ++i) {
+            auto pageStr = concurrentEntries.at(i)->getField(0);
+            if (pageStr.empty()) {
+                cerr << "pageStr is empty, pageKey: " << i << endl;
+                exit(-1);
+            }
+            unordered_map<string, string> page;
+            decodePage(string(pageStr), page);
+            for (const auto &key: page2Keys[concurrentPageKeys.at(i)]) {
+                Entry entry;
+                auto s = page.at(key);
+                entry.importFields({std::move(page.at(key))});
+                resultEntries.emplace_back(std::move(entry));
+            }
+        }
+    };
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, concurrentPageKeys.size()), parallelDecodePage);
     auto finishDecode = chrono::duration_cast<chrono::milliseconds>(chrono::system_clock::now() - beginDecode);
     cout << "<<<<<<<<<< Decode page finished"
          << "|time used(ms)=" << setiosflags(ios_base::fixed) << setprecision(3)
@@ -283,21 +281,22 @@ void
 getKeys(vector<string> &keyVec, int keysNum, int mode, const string &storagePath, bool isLinear = false,
         int pageSize = 0) {
     auto keyInsert = [&]() {
-        int suffixNum = 0;
+        int prefixNum = 1;
         int pageCount = 0;
         for (int i = 0; i < keysNum; ++i) {
             if (pageCount > pageSize) {
-                suffixNum++;
+                prefixNum++;
                 pageCount = 0;
             } else {
                 pageCount++;
             }
-            stringstream suffixStream;
-            suffixStream << std::setfill('0') << std::setw(5) << to_string(suffixNum);
-            auto key = to_string(random()) + (isLinear ? suffixStream.str() : "");
+            stringstream prefixStream;
+            prefixStream << std::setfill('0') << std::setw(5) << to_string(prefixNum);
+            auto key = (isLinear ? prefixStream.str() : "") + to_string(random());
             keyVec.emplace_back(std::move(key));
         }
     };
+
     switch (mode) {
         case 1: {
             // only write, write file
@@ -357,6 +356,7 @@ int main(int argc, const char *argv[]) {
     auto mode = params["mode"].as<int>();
     auto batch = params["batch"].as<bool>();
     auto linear = params["linear"].as<bool>();
+    auto statics = params["static"].as<bool>();
 
     int pageNum = ceil(long(keysNum) * valueLength / MAX_PAGE_CAPACITY) + 1;
 
@@ -376,6 +376,10 @@ int main(int argc, const char *argv[]) {
 
     // options.IncreaseParallelism();
     // options.OptimizeLevelStyleCompaction();
+    if (statics) {
+        rocksdb::get_perf_context()->Reset();
+        rocksdb::get_iostats_context()->Reset();
+    }
 
     // create the DB if it's not already present
     options.create_if_missing = true;
@@ -402,14 +406,32 @@ int main(int argc, const char *argv[]) {
              << elapsed.count() << "|" << endl;
     };
 
+    auto staticOP = [&](bool statics, function<void()> op) {
+        if (statics) {
+            rocksdb::SetPerfLevel(rocksdb::PerfLevel::kEnableTimeExceptForMutex);
+        }
+        op();
+        if (statics) {
+            rocksdb::SetPerfLevel(rocksdb::PerfLevel::kDisable);
+            cout << "rocksDB static:" << endl << rocksdb::get_perf_context()->ToString(true) << endl;
+            cout << "IO static:" << endl << rocksdb::get_iostats_context()->ToString(true) << endl;
+            rocksdb::get_perf_context()->Reset();
+            rocksdb::get_iostats_context()->Reset();
+        }
+    };
+
     cout << "<<<<<<<<<< " << endl;
     cout << "<<<<<<<<<< " << "Check table" << endl;
     createTable(dbStorage, testTableName);
     if (mode & 1 && batch) {
-        writeBatch(dbStorage, testTableName, keyVec, value, pageNum);
+        staticOP(statics, [&]() {
+            writeBatch(dbStorage, testTableName, keyVec, value, pageNum);
+        });
     }
     if (mode & 2 && batch) {
-        readBatch(dbStorage, testTableName, gsl::make_span(keyVec), pageNum, valueLength);
+        staticOP(statics, [&]() {
+            readBatch(dbStorage, testTableName, gsl::make_span(keyVec), pageNum, valueLength);
+        });
     }
     if (mode & 1 && !batch) {
         performance("Write single", [&]() {
